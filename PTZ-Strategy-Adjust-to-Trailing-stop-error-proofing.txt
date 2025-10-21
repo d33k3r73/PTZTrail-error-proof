@@ -49,6 +49,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private double highestProfitReached;
 		private double lowestProfitReached;
 
+		// Enhanced error handling for stop orders
+		private int stopOrderRetryCount;
+		private DateTime lastStopOrderAttempt;
+		private const int MAX_STOP_RETRY_ATTEMPTS = 2;
+		private const int STOP_CALCULATION_DELAY_MS = 100;
+
 		private class LevelCrossInfo
 		{
 			public bool CrossedAbove { get; set; }
@@ -99,7 +105,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				ProfitTargetTicks							= 40;
 
 				EnableTrailStop								= false;
-				TrailStopTicks								= 15;
+				TrailStopTicks								= 30;
 
 				// LBL Filter
 				UseLBLFilter								= false;
@@ -131,15 +137,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 				EnableLevelCooldown							= true;
 				LevelCooldownMinutes						= 5;
 
-				// Complex Trailing Stop
+				// Complex Trailing Stop (Increased defaults for NQ futures)
 				EnableComplexTrailingStop					= true;
-				TrailingStopInitialTicks					= 15;
-				TrailingStopStep1Ticks						= 10;
+				TrailingStopInitialTicks					= 30;
+				TrailingStopStep1Ticks						= 25;
 				TrailingStopStep1TriggerTicks				= 20;
-				TrailingStopStep2Ticks						= 8;
+				TrailingStopStep2Ticks						= 20;
 				TrailingStopStep2TriggerTicks				= 40;
-				TrailingStopStep3Ticks						= 5;
+				TrailingStopStep3Ticks						= 15;
 				TrailingStopStep3TriggerTicks				= 60;
+
+				// Enhanced stop management
+				UsePercentageBasedTrailing					= false;
+				PercentageTrailOffset						= 0.4;
+				MinimumStopDistanceTicks					= 10;
+				EnableStopCalculationDelay					= true;
 			}
 			else if (State == State.Configure)
 			{
@@ -163,6 +175,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				trailStopPrice = 0;
 				highestProfitReached = 0;
 				lowestProfitReached = 0;
+				stopOrderRetryCount = 0;
+				lastStopOrderAttempt = DateTime.MinValue;
 			}
 		}
 
@@ -997,24 +1011,48 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			try
 			{
-				if (Position.MarketPosition == MarketPosition.Flat)
-					return;
+			if (Position.MarketPosition == MarketPosition.Flat)
+			{
+				// Reset retry counter when flat
+				stopOrderRetryCount = 0;
+				return;
+			}
 
-				double currentPrice = Close[0];
-				double unrealizedProfitTicks = 0;
-				double newStopPrice = 0;
-				double trailDistance = TrailingStopInitialTicks;
-
-				if (Position.MarketPosition == MarketPosition.Long)
+			// Add calculation delay to avoid chasing price too aggressively
+			if (EnableStopCalculationDelay)
+			{
+				TimeSpan timeSinceLastAttempt = Time[0] - lastStopOrderAttempt;
+				if (timeSinceLastAttempt.TotalMilliseconds < STOP_CALCULATION_DELAY_MS)
 				{
-					unrealizedProfitTicks = (currentPrice - Position.AveragePrice) / TickSize;
+					return; // Too soon, skip this update
+				}
+			}
 
-					// Track highest profit reached
-					if (unrealizedProfitTicks > highestProfitReached)
-					{
-						highestProfitReached = unrealizedProfitTicks;
-					}
+			double currentPrice = Close[0];
+			double unrealizedProfitTicks = 0;
+			double newStopPrice = 0;
+			double trailDistance = TrailingStopInitialTicks;
 
+			if (Position.MarketPosition == MarketPosition.Long)
+			{
+				unrealizedProfitTicks = (currentPrice - Position.AveragePrice) / TickSize;
+
+				// Track highest profit reached
+				if (unrealizedProfitTicks > highestProfitReached)
+				{
+					highestProfitReached = unrealizedProfitTicks;
+				}
+
+				// Use percentage-based trailing if enabled
+				if (UsePercentageBasedTrailing)
+				{
+					trailDistance = Math.Max(
+						(Position.AveragePrice * PercentageTrailOffset / 100.0) / TickSize,
+						MinimumStopDistanceTicks
+					);
+				}
+				else
+				{
 					// Determine trail distance based on profit tiers
 					if (highestProfitReached >= TrailingStopStep3TriggerTicks)
 					{
@@ -1028,28 +1066,53 @@ namespace NinjaTrader.NinjaScript.Strategies
 					{
 						trailDistance = TrailingStopStep1Ticks;
 					}
+				}
 
-					newStopPrice = currentPrice - (trailDistance * TickSize);
+				newStopPrice = currentPrice - (trailDistance * TickSize);
 
-					// Initialize or update stop price
-					if (trailStopPrice == 0 || newStopPrice > trailStopPrice)
+				// Validate stop price with minimum buffer below current price
+				double minStopPrice = currentPrice - ((trailDistance + MinimumStopDistanceTicks) * TickSize);
+				if (newStopPrice > minStopPrice)
+				{
+					newStopPrice = minStopPrice;
+					Print(string.Format("{0}: Long stop adjusted to safe distance: {1:F2}", Time[0], newStopPrice));
+				}
+
+				// Initialize or update stop price
+				if (trailStopPrice == 0 || newStopPrice > trailStopPrice)
+				{
+					trailStopPrice = newStopPrice;
+
+					// Attempt to set stop with error handling
+					if (TrySetStopLoss(trailStopPrice, MarketPosition.Long, currentPrice))
 					{
-						trailStopPrice = newStopPrice;
-						SetStopLoss(CalculationMode.Price, trailStopPrice);
-						Print(string.Format("{0}: Long Trailing Stop updated to {1:F2} (Trail: {2} ticks, Profit: {3:F1} ticks)",
+						stopOrderRetryCount = 0;
+						lastStopOrderAttempt = Time[0];
+						Print(string.Format("{0}: Long Trailing Stop updated to {1:F2} (Trail: {2:F1} ticks, Profit: {3:F1} ticks)",
 							Time[0], trailStopPrice, trailDistance, unrealizedProfitTicks));
 					}
 				}
-				else if (Position.MarketPosition == MarketPosition.Short)
+			}
+			else if (Position.MarketPosition == MarketPosition.Short)
+			{
+				unrealizedProfitTicks = (Position.AveragePrice - currentPrice) / TickSize;
+
+				// Track lowest profit reached (highest for shorts)
+				if (unrealizedProfitTicks > lowestProfitReached)
 				{
-					unrealizedProfitTicks = (Position.AveragePrice - currentPrice) / TickSize;
+					lowestProfitReached = unrealizedProfitTicks;
+				}
 
-					// Track lowest profit reached (highest for shorts)
-					if (unrealizedProfitTicks > lowestProfitReached)
-					{
-						lowestProfitReached = unrealizedProfitTicks;
-					}
-
+				// Use percentage-based trailing if enabled
+				if (UsePercentageBasedTrailing)
+				{
+					trailDistance = Math.Max(
+						(Position.AveragePrice * PercentageTrailOffset / 100.0) / TickSize,
+						MinimumStopDistanceTicks
+					);
+				}
+				else
+				{
 					// Determine trail distance based on profit tiers
 					if (lowestProfitReached >= TrailingStopStep3TriggerTicks)
 					{
@@ -1063,22 +1126,131 @@ namespace NinjaTrader.NinjaScript.Strategies
 					{
 						trailDistance = TrailingStopStep1Ticks;
 					}
+				}
 
-					newStopPrice = currentPrice + (trailDistance * TickSize);
+				newStopPrice = currentPrice + (trailDistance * TickSize);
 
-					// Initialize or update stop price
-					if (trailStopPrice == 0 || newStopPrice < trailStopPrice)
+				// Validate stop price with minimum buffer above current price
+				double currentBid = GetCurrentBidPrice();
+				double minStopPrice = currentBid + (MinimumStopDistanceTicks * TickSize);
+
+				// CRITICAL: For short positions, buy-to-cover stop MUST be above market
+				if (newStopPrice <= minStopPrice)
+				{
+					newStopPrice = minStopPrice;
+					Print(string.Format("{0}: Short stop adjusted to safe distance above bid: {1:F2} (Bid: {2:F2}, Buffer: {3} ticks)",
+						Time[0], newStopPrice, currentBid, MinimumStopDistanceTicks));
+				}
+
+				// Initialize or update stop price
+				if (trailStopPrice == 0 || newStopPrice < trailStopPrice)
+				{
+					trailStopPrice = newStopPrice;
+
+					// Attempt to set stop with error handling
+					if (TrySetStopLoss(trailStopPrice, MarketPosition.Short, currentPrice))
 					{
-						trailStopPrice = newStopPrice;
-						SetStopLoss(CalculationMode.Price, trailStopPrice);
-						Print(string.Format("{0}: Short Trailing Stop updated to {1:F2} (Trail: {2} ticks, Profit: {3:F1} ticks)",
+						stopOrderRetryCount = 0;
+						lastStopOrderAttempt = Time[0];
+						Print(string.Format("{0}: Short Trailing Stop updated to {1:F2} (Trail: {2:F1} ticks, Profit: {3:F1} ticks)",
 							Time[0], trailStopPrice, trailDistance, unrealizedProfitTicks));
 					}
 				}
 			}
+
+			}
 			catch (Exception ex)
 			{
 				Print(string.Format("{0}: ERROR managing trailing stop: {1}", Time[0], ex.Message));
+				// Strategy remains enabled - error is logged but doesn't disable strategy
+			}
+		}
+
+		private bool TrySetStopLoss(double stopPrice, MarketPosition position, double currentPrice)
+		{
+			try
+			{
+				double currentBid = GetCurrentBidPrice();
+				double currentAsk = GetCurrentAskPrice();
+
+				// Final validation before placing order
+				if (position == MarketPosition.Short)
+				{
+					// Buy-to-cover stop MUST be above current bid
+					if (stopPrice <= currentBid)
+					{
+						if (stopOrderRetryCount < MAX_STOP_RETRY_ATTEMPTS)
+						{
+							stopOrderRetryCount++;
+							double adjustedStop = currentBid + (MinimumStopDistanceTicks * TickSize);
+							Print(string.Format("{0}: Stop order validation failed - adjusting from {1:F2} to {2:F2} (Attempt {3}/{4})",
+								Time[0], stopPrice, adjustedStop, stopOrderRetryCount, MAX_STOP_RETRY_ATTEMPTS));
+							stopPrice = adjustedStop;
+						}
+						else
+						{
+							Print(string.Format("{0}: Stop order retry limit reached - keeping previous stop", Time[0]));
+							return false;
+						}
+					}
+				}
+				else if (position == MarketPosition.Long)
+				{
+					// Sell stop MUST be below current ask
+					if (stopPrice >= currentAsk)
+					{
+						if (stopOrderRetryCount < MAX_STOP_RETRY_ATTEMPTS)
+						{
+							stopOrderRetryCount++;
+							double adjustedStop = currentAsk - (MinimumStopDistanceTicks * TickSize);
+							Print(string.Format("{0}: Stop order validation failed - adjusting from {1:F2} to {2:F2} (Attempt {3}/{4})",
+								Time[0], stopPrice, adjustedStop, stopOrderRetryCount, MAX_STOP_RETRY_ATTEMPTS));
+							stopPrice = adjustedStop;
+						}
+						else
+						{
+							Print(string.Format("{0}: Stop order retry limit reached - keeping previous stop", Time[0]));
+							return false;
+						}
+					}
+				}
+
+				// Place the stop order
+				SetStopLoss(CalculationMode.Price, stopPrice);
+				return true;
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: ERROR in TrySetStopLoss: {1} - Strategy continues running", Time[0], ex.Message));
+				return false;
+			}
+		}
+
+		private double GetCurrentBidPrice()
+		{
+			try
+			{
+				if (GetCurrentBid() != null)
+					return GetCurrentBid().Price;
+				return Close[0]; // Fallback to last close
+			}
+			catch
+			{
+				return Close[0];
+			}
+		}
+
+		private double GetCurrentAskPrice()
+		{
+			try
+			{
+				if (GetCurrentAsk() != null)
+					return GetCurrentAsk().Price;
+				return Close[0]; // Fallback to last close
+			}
+			catch
+			{
+				return Close[0];
 			}
 		}
 
@@ -1586,6 +1758,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(1, int.MaxValue)]
 		[Display(Name="Step 3 Trigger (Ticks)", Description="Profit ticks to activate Step 3 trail", Order=8, GroupName="8) Complex Trailing Stop")]
 		public int TrailingStopStep3TriggerTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Percentage-Based Trailing", Description="Use percentage of entry price instead of fixed ticks", Order=9, GroupName="8) Complex Trailing Stop")]
+		public bool UsePercentageBasedTrailing
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0.1, 2.0)]
+		[Display(Name="Percentage Trail Offset (%)", Description="Trail offset as percentage of entry price (e.g., 0.4 = 0.4%)", Order=10, GroupName="8) Complex Trailing Stop")]
+		public double PercentageTrailOffset
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, 100)]
+		[Display(Name="Minimum Stop Distance (Ticks)", Description="Minimum buffer between stop price and market price", Order=11, GroupName="8) Complex Trailing Stop")]
+		public int MinimumStopDistanceTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Stop Calculation Delay", Description="Add delay between stop recalculations to prevent chasing price", Order=12, GroupName="8) Complex Trailing Stop")]
+		public bool EnableStopCalculationDelay
 		{ get; set; }
 
 		#endregion
